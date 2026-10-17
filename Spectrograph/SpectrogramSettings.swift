@@ -157,6 +157,19 @@ enum AxisTicks {
         return out
     }
 
+    /// Частота по вертикальной доле (0 — низ, 1 — верх) для текущей шкалы.
+    static func frequency(forFraction fraction: Double, maxFrequency: Double, logScale: Bool) -> Double {
+        guard maxFrequency > 0 else { return 0 }
+        let f = min(max(fraction, 0), 1)
+        if logScale {
+            let fmin = max(20.0, maxFrequency / 1000.0)
+            let lmin = log10(fmin)
+            let lmax = log10(maxFrequency)
+            return pow(10, lmin + (lmax - lmin) * f)
+        }
+        return maxFrequency * f
+    }
+
     /// «Красивый» шаг сетки (1, 2, 5, 10, …).
     static func niceStep(_ raw: Double) -> Double {
         guard raw > 0, raw.isFinite else { return 1 }

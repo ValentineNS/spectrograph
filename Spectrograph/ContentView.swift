@@ -25,10 +25,16 @@ struct SpectrographScreen: View {
     @ObservedObject var settings: SpectrogramSettings
     @ObservedObject var analyzer: AudioAnalyzer
 
+    @StateObject private var playback = AudioPlayback()
+
     @State private var showSettings = false
     @State private var showShare = false
     @State private var exportURL: URL?
     @State private var pixelWidth: Double = 0
+
+    @State private var selections: [SpectralSelection] = []
+    @State private var isProcessing = false
+    @State private var showAudioShare = false
 
     private static let fileFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -52,6 +58,10 @@ struct SpectrographScreen: View {
         return pixelWidth / columnRate
     }
 
+    private var canSelect: Bool {
+        !analyzer.isRunning && analyzer.frozenFrames > 0 && !analyzer.store.isEmpty
+    }
+
     var body: some View {
         VStack(spacing: 6) {
             readouts
@@ -68,16 +78,21 @@ struct SpectrographScreen: View {
                                 minDB: Float(settings.minDB),
                                 maxDB: Float(settings.topDB),
                                 colorMap: settings.colorMap,
-                                onPixelWidth: { pixelWidth = $0 })
+                                onPixelWidth: { width in
+                                    pixelWidth = width
+                                    analyzer.visibleColumns = Int(width.rounded())
+                                })
                     .background(Color.black)
-                    .overlay(Rectangle().stroke(Color.gray.opacity(0.35), lineWidth: 1))
                     .clipped()
+                    .overlay(SelectionOverlay(enabled: canSelect, selections: $selections))
+                    .overlay(Rectangle().stroke(Color.gray.opacity(0.35), lineWidth: 1))
             }
 
             TimeAxisView(historySeconds: historySeconds)
                 .frame(height: 16)
                 .padding(.leading, 46)
 
+            hintRow
             controls
         }
         .padding(8)
@@ -90,15 +105,27 @@ struct SpectrographScreen: View {
                 ShareSheet(items: [url])
             }
         }
+        .sheet(isPresented: $showAudioShare) {
+            if let url = exportURL {
+                ShareSheet(items: [url])
+            }
+        }
         .alert("Ошибка", isPresented: Binding(
-            get: { analyzer.errorMessage != nil },
-            set: { present in if !present { analyzer.errorMessage = nil } }
+            get: { analyzer.errorMessage != nil || playback.errorMessage != nil },
+            set: { present in
+                if !present {
+                    analyzer.errorMessage = nil
+                    playback.errorMessage = nil
+                }
+            }
         )) {
             Button("ОК", role: .cancel) {}
         } message: {
-            Text(analyzer.errorMessage ?? "")
+            Text(analyzer.errorMessage ?? playback.errorMessage ?? "")
         }
     }
+
+    // MARK: - Показания
 
     private var readouts: some View {
         HStack(alignment: .firstTextBaseline) {
@@ -138,41 +165,234 @@ struct SpectrographScreen: View {
         return String(format: "%@ · %.0f дБ", fText, analyzer.peakDB)
     }
 
-    private var controls: some View {
-        HStack(spacing: 8) {
-            Button {
-                if analyzer.isRunning {
-                    analyzer.stop()
-                } else {
-                    analyzer.start()
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: analyzer.isRunning ? "stop.fill" : "mic.fill")
-                    Text(analyzer.isRunning ? "Стоп" : "Старт")
-                }
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(analyzer.isRunning ? .red : .accentColor)
+    // MARK: - Подсказка и ход обработки
 
-            Button {
-                showSettings = true
-            } label: {
-                Image(systemName: "slider.horizontal.3")
-                    .frame(width: 32)
+    @ViewBuilder
+    private var hintRow: some View {
+        if isProcessing {
+            HStack(spacing: 6) {
+                ProgressView()
+                Text("Обработка звука…")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Spacer()
             }
-            .buttonStyle(.bordered)
-
-            Button {
-                exportPNG()
-            } label: {
-                Image(systemName: "square.and.arrow.up")
-                    .frame(width: 32)
-            }
-            .buttonStyle(.bordered)
+        } else if analyzer.isRunning {
+            Text("Остановите запись (Стоп), чтобы выделять области на спектрограмме.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else if canSelect {
+            Text("Проведите по спектрограмме, чтобы выделить составляющую. Выделений: \(selections.count).")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Text("Нажмите «Старт», чтобы записать звук.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+
+    // MARK: - Кнопки
+
+    private var controls: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Button {
+                    if analyzer.isRunning {
+                        analyzer.stop()
+                    } else {
+                        selections.removeAll()
+                        playback.stop()
+                        analyzer.start()
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: analyzer.isRunning ? "stop.fill" : "mic.fill")
+                        Text(analyzer.isRunning ? "Стоп" : "Старт")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(analyzer.isRunning ? .red : .accentColor)
+
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .frame(width: 30)
+                }
+                .buttonStyle(.bordered)
+
+                Menu {
+                    Button("PNG спектрограммы") { exportPNG() }
+                    Divider()
+                    Button("WAV — выделенное") { exportAudio(.isolate) }
+                        .disabled(selections.isEmpty)
+                    Button("WAV — остальное") { exportAudio(.remove) }
+                        .disabled(selections.isEmpty)
+                    Button("WAV — оригинал") { exportAudio(nil) }
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                        .frame(width: 30)
+                }
+                .buttonStyle(.bordered)
+            }
+
+            if canSelect {
+                HStack(spacing: 6) {
+                    Button {
+                        play(.isolate)
+                    } label: {
+                        Label("Выдел.", systemImage: "play.circle")
+                    }
+                    .disabled(selections.isEmpty || isProcessing)
+
+                    Button {
+                        play(.remove)
+                    } label: {
+                        Label("Остал.", systemImage: "play.circle")
+                    }
+                    .disabled(selections.isEmpty || isProcessing)
+
+                    Button {
+                        play(nil)
+                    } label: {
+                        Label("Ориг.", systemImage: "play.circle")
+                    }
+                    .disabled(isProcessing)
+
+                    Menu {
+                        if selections.isEmpty {
+                            Text("Нет выделений")
+                        } else {
+                            ForEach(Array(selections.indices), id: \.self) { index in
+                                Button("Компонента \(index + 1)") { playSelection(index) }
+                            }
+                            Divider()
+                            Button("Очистить всё", role: .destructive) {
+                                selections.removeAll()
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .disabled(isProcessing)
+                }
+                .font(.system(size: 13))
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            if playback.isPlaying {
+                Button {
+                    playback.stop()
+                } label: {
+                    Label("Остановить звук", systemImage: "stop.circle")
+                        .font(.system(size: 13))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.red)
+            }
+        }
+    }
+
+    // MARK: - Обработка и воспроизведение
+
+    private func play(_ mode: MaskMode?) {
+        processAudio(mode: mode, selections: selections) { url in
+            if let url = url { playback.play(url: url) }
+        }
+    }
+
+    private func playSelection(_ index: Int) {
+        guard index >= 0, index < selections.count else { return }
+        let single = [selections[index]]
+        processAudio(mode: .isolate, selections: single) { url in
+            if let url = url { playback.play(url: url) }
+        }
+    }
+
+    private func exportAudio(_ mode: MaskMode?) {
+        processAudio(mode: mode, selections: selections) { url in
+            if let url = url {
+                exportURL = url
+                showAudioShare = true
+            }
+        }
+    }
+
+    private func processAudio(mode: MaskMode?,
+                              selections sels: [SpectralSelection],
+                              completion: @escaping (URL?) -> Void) {
+        guard !analyzer.isRunning else {
+            analyzer.errorMessage = "Сначала остановите запись."
+            return
+        }
+        if mode != nil && sels.isEmpty {
+            analyzer.errorMessage = "Сначала выделите область на спектрограмме."
+            return
+        }
+
+        let meta = analyzer.store.meta
+        guard meta.totalFrames > 0 else {
+            analyzer.errorMessage = "Нет записанного звука."
+            return
+        }
+
+        let samples = analyzer.store.snapshot()
+        let sampleRate = meta.sampleRate
+        let maxFreq = min(effectiveMaxFrequency, sampleRate / 2)
+        let logScale = settings.logScale
+        let fftSize = meta.fftSize
+
+        isProcessing = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            var output = samples
+            if let mode = mode {
+                if let processor = SpectralProcessor(fftSize: fftSize) {
+                    output = processor.render(samples: samples,
+                                              sampleRate: sampleRate,
+                                              totalFrames: meta.totalFrames,
+                                              visibleColumns: meta.visibleColumns,
+                                              selections: sels,
+                                              maxFrequency: maxFreq,
+                                              logScale: logScale,
+                                              mode: mode)
+                }
+            }
+
+            var url: URL?
+            if !output.isEmpty {
+                let name = "spectro-\(Self.fileFormatter.string(from: Date())).wav"
+                let target = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+                do {
+                    try WavWriter.write(samples: output, sampleRate: sampleRate, to: target)
+                    url = target
+                } catch {
+                    DispatchQueue.main.async {
+                        self.isProcessing = false
+                        self.analyzer.errorMessage = "Не удалось сохранить звук: \(error.localizedDescription)"
+                    }
+                    return
+                }
+            }
+
+            DispatchQueue.main.async {
+                self.isProcessing = false
+                if url == nil {
+                    self.analyzer.errorMessage = "Не удалось обработать звук."
+                }
+                completion(url)
+            }
+        }
+    }
+
+    // MARK: - Экспорт PNG
 
     private var captionText: String {
         "БПФ \(settings.fftSize) · 0–\(Int(effectiveMaxFrequency)) Гц · \(Int(settings.dynamicRange)) дБ · \(settings.colorMap.title)"
@@ -235,6 +455,10 @@ struct SettingsView: View {
                             Text(map.title).tag(map)
                         }
                     }
+                }
+                Section(header: Text("Справка")) {
+                    Text("Чтобы разделить звук на составляющие: остановите запись, проведите пальцем по спектрограмме (это выделит область «частота × время»), затем «Выдел.» проиграет только её, а «Остал.» — всё, кроме неё.")
+                        .font(.system(size: 13))
                 }
             }
             .navigationTitle("Настройки")

@@ -11,8 +11,14 @@ final class AudioAnalyzer: ObservableObject {
     @Published var peakFrequency: Double = 0
     @Published var sampleRate: Double = 44100
     @Published var errorMessage: String?
+    @Published var frozenFrames: Int = 0
 
     let buffer = WaterfallBuffer()
+    /// Записанный звук текущего сеанса (для спектрального анализа).
+    let store = AudioStore()
+
+    /// Число видимых столбцов спектрограммы — задаётся из интерфейса.
+    var visibleColumns: Int = 0
 
     private let settings: SpectrogramSettings
     private let engine = AVAudioEngine()
@@ -60,6 +66,9 @@ final class AudioAnalyzer: ObservableObject {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         isRunning = false
+        // Оставляем ровно то, что видно на спектрограмме.
+        store.freeze(visibleColumns: visibleColumns)
+        frozenFrames = store.totalFrames
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
         DispatchQueue.main.async { [weak self] in
             self?.levelDB = -120
@@ -114,6 +123,8 @@ final class AudioAnalyzer: ObservableObject {
         pending.removeAll(keepingCapacity: true)
         readIndex = 0
         latestDB = nil
+        store.reset(sampleRate: format.sampleRate, fftSize: fftSize)
+        frozenFrames = 0
 
         input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] pcm, _ in
             self?.process(pcm)
@@ -157,6 +168,7 @@ final class AudioAnalyzer: ObservableObject {
         let level = 20 * log10f(max(rms, 1e-7))
 
         pending.append(contentsOf: scratch[0..<frames])
+        store.append(scratch[0..<frames])
 
         let hop = max(1, fftSize / 2)
         while pending.count - readIndex >= fftSize {

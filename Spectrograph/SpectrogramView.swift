@@ -170,3 +170,71 @@ enum SpectrogramExporter {
         }
     }
 }
+
+/// Прозрачный слой поверх спектрограммы: выделение областей перетаскиванием.
+struct SelectionOverlay: View {
+    let enabled: Bool
+    @Binding var selections: [SpectralSelection]
+
+    @State private var draftStart: CGPoint?
+    @State private var draftEnd: CGPoint?
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .topLeading) {
+                ForEach(selections) { sel in
+                    selectionView(sel, in: geo.size)
+                }
+                if let s = draftStart, let e = draftEnd {
+                    Rectangle()
+                        .fill(Color.accentColor.opacity(0.18))
+                        .overlay(Rectangle().stroke(Color.accentColor,
+                                                    style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                        .frame(width: abs(e.x - s.x), height: abs(e.y - s.y))
+                        .position(x: (s.x + e.x) / 2, y: (s.y + e.y) / 2)
+                }
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .contentShape(Rectangle())
+            .gesture(dragGesture(size: geo.size), including: enabled ? .all : .none)
+        }
+    }
+
+    private func selectionView(_ sel: SpectralSelection, in size: CGSize) -> some View {
+        let x0 = sel.x0 * size.width
+        let x1 = sel.x1 * size.width
+        let y0 = (1 - sel.y1) * size.height
+        let y1 = (1 - sel.y0) * size.height
+        return Rectangle()
+            .fill(Color.accentColor.opacity(0.22))
+            .overlay(Rectangle().stroke(Color.accentColor, lineWidth: 1.5))
+            .frame(width: max(1, x1 - x0), height: max(1, y1 - y0))
+            .position(x: (x0 + x1) / 2, y: (y0 + y1) / 2)
+    }
+
+    private func dragGesture(size: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 3)
+            .onChanged { value in
+                if draftStart == nil { draftStart = value.startLocation }
+                draftEnd = value.location
+            }
+            .onEnded { value in
+                let start = draftStart ?? value.startLocation
+                let end = value.location
+                draftStart = nil
+                draftEnd = nil
+                guard size.width > 0, size.height > 0 else { return }
+
+                let x0 = min(start.x, end.x) / size.width
+                let x1 = max(start.x, end.x) / size.width
+                let y0 = 1 - max(start.y, end.y) / size.height
+                let y1 = 1 - min(start.y, end.y) / size.height
+                guard x1 - x0 >= 0.02, y1 - y0 >= 0.02 else { return }
+
+                selections.append(SpectralSelection(x0: Double(x0),
+                                                    x1: Double(x1),
+                                                    y0: Double(y0),
+                                                    y1: Double(y1)))
+            }
+    }
+}
