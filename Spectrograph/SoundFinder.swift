@@ -191,7 +191,7 @@ final class SoundFinder: ObservableObject {
             bestDB = Swift.max(level, bestDB - 0.5)
         }
         if haveYaw && hasDirection {
-            var a = currentYaw - bestYaw
+            var a = bestYaw - currentYaw
             while a > .pi { a -= 2 * .pi }
             while a < -(.pi) { a += 2 * .pi }
             arrowDegrees = a * 180.0 / .pi
