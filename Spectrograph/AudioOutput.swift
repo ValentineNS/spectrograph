@@ -48,9 +48,11 @@ enum WavWriter {
 /// Проигрывание подготовленного звука из файла.
 final class AudioPlayback: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var isPlaying = false
+    @Published var progress: Double = 0
     @Published var errorMessage: String?
 
     private var player: AVAudioPlayer?
+    private var timer: Timer?
 
     func play(url: URL) {
         do {
@@ -70,20 +72,39 @@ final class AudioPlayback: NSObject, ObservableObject, AVAudioPlayerDelegate {
             p.play()
             player = p
             isPlaying = true
+            progress = 0
+            startTimer()
         } catch {
             errorMessage = "Не удалось воспроизвести звук: \(error.localizedDescription)"
         }
     }
 
+    private func startTimer() {
+        timer?.invalidate()
+        let t = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self = self, let p = self.player else { return }
+            let d = p.duration
+            self.progress = d > 0 ? Swift.min(1, Swift.max(0, p.currentTime / d)) : 0
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
     func stop() {
+        timer?.invalidate()
+        timer = nil
         player?.stop()
         player = nil
         isPlaying = false
+        progress = 0
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         DispatchQueue.main.async { [weak self] in
+            self?.timer?.invalidate()
+            self?.timer = nil
             self?.isPlaying = false
+            self?.progress = 1
         }
     }
 }

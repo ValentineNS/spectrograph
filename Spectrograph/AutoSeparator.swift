@@ -1,5 +1,4 @@
 import Foundation
-import Accelerate
 
 /// Автоматически разложенный компонент звука.
 struct AutoComponent: Identifiable {
@@ -7,6 +6,16 @@ struct AutoComponent: Identifiable {
     let title: String
     let detail: String
     let url: URL
+    /// Пересобранный звук компонента (для микширования «играть все»).
+    let samples: [Float]
+    /// Полоса частот компонента (для искателя направления), Гц.
+    let bandLow: Double
+    let bandHigh: Double
+    /// Превью маски: `previewCols × previewRows`, значения 0…1.
+    /// Строка 0 — верх (высокие частоты), столбцы — время слева направо.
+    let preview: [Float]
+    let previewCols: Int
+    let previewRows: Int
 }
 
 /// Автоматическое разложение записи на составляющие:
@@ -85,7 +94,6 @@ enum AutoSeparator {
 
         func median(_ buf: inout [Float], _ n: Int) -> Float {
             if n <= 0 { return 0 }
-            // сортировка вставками (n мало)
             var i = 1
             while i < n {
                 let v = buf[i]
@@ -102,7 +110,6 @@ enum AutoSeparator {
 
         var Mh = [Float](repeating: 0, count: total)
         do {
-            // гармоническая часть: медиана по времени для каждого бина
             let hHalf = hWindow / 2
             for f in 0..<totalFrames {
                 let a = Swift.max(0, f - hHalf)
@@ -117,14 +124,12 @@ enum AutoSeparator {
                         i += 1
                     }
                     let hv = median(&colBuf, n)
-                    // ударная часть: медиана по частоте
-                    let pBase = f * bins
                     let pa = Swift.max(0, k - pWindow / 2)
                     let pb = Swift.min(bins - 1, k + pWindow / 2)
                     var pn = 0
                     var j = pa
                     while j <= pb {
-                        rowBuf[pn] = mag[pBase + j]
+                        rowBuf[pn] = mag[base + j]
                         pn += 1
                         j += 1
                     }
@@ -292,7 +297,6 @@ enum AutoSeparator {
             }
         }
 
-        // Суммарная занятость тонами + отдельно «прочие тона».
         var bumpAll = [Float](repeating: 0, count: total)
         var bumpOther = [Float](repeating: 0, count: total)
         for (index, source) in good.enumerated() {
@@ -321,7 +325,40 @@ enum AutoSeparator {
             return (s / Float(v.count)).squareRoot()
         }
 
-        func emit(title: String, detail: String, mask: [Float]) {
+        // Превью маски: 0…1, строка 0 — верх (высокие частоты).
+        let previewCols = Swift.max(1, Swift.min(totalFrames, 200))
+        let previewRows = 64
+
+        func makePreview(_ mask: [Float]) -> [Float] {
+            var out = [Float](repeating: 0, count: previewCols * previewRows)
+            let binCount = Swift.max(1, maxBin)
+            for py in 0..<previewRows {
+                let fHi = Double(previewRows - py) / Double(previewRows)
+                let fLo = Double(previewRows - py - 1) / Double(previewRows)
+                var k0 = Int(fLo * Double(binCount))
+                var k1 = Int(fHi * Double(binCount))
+                if k0 < 0 { k0 = 0 }
+                if k1 <= k0 { k1 = k0 + 1 }
+                if k1 > bins { k1 = bins }
+                for px in 0..<previewCols {
+                    let f0 = px * totalFrames / previewCols
+                    let f1 = Swift.max(f0 + 1, (px + 1) * totalFrames / previewCols)
+                    var mx: Float = 0
+                    for f in f0..<f1 {
+                        let base = f * bins
+                        for k in k0..<k1 {
+                            let v = mask[base + k]
+                            if v > mx { mx = v }
+                        }
+                    }
+                    out[py * previewCols + px] = mx
+                }
+            }
+            return out
+        }
+
+        func emit(title: String, detail: String, mask: [Float],
+                  bandLow: Double, bandHigh: Double) {
             guard mask.count == total else { return }
             let rendered = processor.renderWithMask(samples: samples, totalFrames: totalFrames, mask: mask)
             guard !rendered.isEmpty, rms(rendered) > 1e-4 else { return }
@@ -329,7 +366,15 @@ enum AutoSeparator {
             do {
                 try WavWriter.write(samples: rendered, sampleRate: sampleRate, to: url)
                 fileIndex += 1
-                result.append(AutoComponent(title: title, detail: detail, url: url))
+                result.append(AutoComponent(title: title,
+                                            detail: detail,
+                                            url: url,
+                                            samples: rendered,
+                                            bandLow: bandLow,
+                                            bandHigh: bandHigh,
+                                            preview: makePreview(mask),
+                                            previewCols: previewCols,
+                                            previewRows: previewRows))
             } catch {
                 // пропускаем неудачный компонент
             }
@@ -369,15 +414,18 @@ enum AutoSeparator {
             let seconds = Double(source.frames.count) * Double(hop) / sampleRate
             emit(title: "Тон \(index + 1) · \(frequencyTitle(medianFreq))",
                  detail: String(format: "%.1f с", seconds),
-                 mask: mask)
+                 mask: mask,
+                 bandLow: Swift.max(40, medianFreq * 0.8),
+                 bandHigh: medianFreq * 1.25)
         }
 
         // Прочие тона
         if good.count > maxSources {
-            let mask = combine(bumpOther)
             emit(title: "Прочие тона",
                  detail: "источников: \(good.count - maxSources)",
-                 mask: mask)
+                 mask: combine(bumpOther),
+                 bandLow: 0,
+                 bandHigh: fmax)
         }
 
         // Ударные (транзиенты): всё, что не гармоническое
@@ -388,7 +436,7 @@ enum AutoSeparator {
                 mask[i] = 1 - Mh[i]
                 i += 1
             }
-            emit(title: "Ударные (стук, щелчки)", detail: "", mask: mask)
+            emit(title: "Ударные (стук, щелчки)", detail: "", mask: mask, bandLow: 0, bandHigh: fmax)
         }
 
         // Шум / остаток: гармоническое, не объяснённое тонами
@@ -400,7 +448,7 @@ enum AutoSeparator {
                 mask[i] = Mh[i] * (1 - cover)
                 i += 1
             }
-            emit(title: "Шум / остаток", detail: "", mask: mask)
+            emit(title: "Шум / остаток", detail: "", mask: mask, bandLow: 0, bandHigh: fmax)
         }
 
         return result

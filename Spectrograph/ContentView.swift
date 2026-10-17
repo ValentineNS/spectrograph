@@ -1,4 +1,6 @@
+import Foundation
 import SwiftUI
+import CoreGraphics
 
 /// Корневое представление приложения.
 struct ContentView: View {
@@ -49,6 +51,8 @@ struct SpectrographScreen: View {
     @State private var isProcessing = false
 
     @State private var autoComponents: [AutoComponent] = []
+    @State private var autoSpectrogram: CGImage?
+    @State private var autoSampleRate: Double = 44100
     @State private var isAutoProcessing = false
 
     private static let fileFormatter: DateFormatter = {
@@ -119,7 +123,10 @@ struct SpectrographScreen: View {
             case .share(let url):
                 ShareSheet(items: [url])
             case .auto:
-                AutoDecomposeView(components: autoComponents, playback: playback)
+                AutoDecomposeView(components: autoComponents,
+                                  spectrogram: autoSpectrogram,
+                                  sampleRate: autoSampleRate,
+                                  playback: playback)
             }
         }
         .alert("Ошибка", isPresented: Binding(
@@ -356,6 +363,8 @@ struct SpectrographScreen: View {
                     self.analyzer.errorMessage = "Не удалось разложить звук на составляющие."
                 } else {
                     self.autoComponents = components
+                    self.autoSpectrogram = self.analyzer.buffer.snapshot()
+                    self.autoSampleRate = sampleRate
                     self.activeSheet = .auto
                 }
             }
@@ -486,63 +495,385 @@ struct SpectrographScreen: View {
 // MARK: - Окно «Составляющие звука»
 
 struct AutoDecomposeView: View {
-    let components: [AutoComponent]
+    let allComponents: [AutoComponent]
+    let spectrogram: CGImage?
+    let sampleRate: Double
     @ObservedObject var playback: AudioPlayback
 
     @Environment(\.dismiss) private var dismiss
+    @State private var items: [AutoComponent]
+
     @State private var playingID: UUID?
+    @State private var playingAll = false
+
+    @State private var overlayImage: CGImage?
     @State private var exportURL: URL?
     @State private var showShare = false
+    @State private var finderComponent: AutoComponent?
+
+    private static let palette: [(Float, Float, Float)] = [
+        (0.20, 0.85, 1.00),
+        (1.00, 0.85, 0.20),
+        (0.40, 0.95, 0.45),
+        (1.00, 0.55, 0.20),
+        (1.00, 0.45, 0.75),
+        (0.70, 0.55, 1.00),
+        (1.00, 0.35, 0.35),
+        (0.45, 0.65, 1.00)
+    ]
+
+    init(components: [AutoComponent],
+         spectrogram: CGImage?,
+         sampleRate: Double,
+         playback: AudioPlayback) {
+        self.allComponents = components
+        self.spectrogram = spectrogram
+        self.sampleRate = sampleRate
+        self._playback = ObservedObject(wrappedValue: playback)
+        self._items = State(initialValue: components)
+    }
 
     var body: some View {
         NavigationView {
-            List {
-                Section(header: Text("Составляющие · \(components.count)")) {
-                    ForEach(components) { comp in
-                        HStack(spacing: 12) {
-                            Button {
-                                if playingID == comp.id && playback.isPlaying {
-                                    playback.stop()
-                                    playingID = nil
-                                } else {
-                                    playback.play(url: comp.url)
-                                    playingID = comp.id
-                                }
-                            } label: {
-                                Image(systemName: (playingID == comp.id && playback.isPlaying)
-                                      ? "pause.circle.fill" : "play.circle.fill")
-                                    .font(.system(size: 27))
-                            }
-                            .buttonStyle(.plain)
+            VStack(spacing: 10) {
+                preview
 
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(comp.title)
-                                    .font(.system(size: 15, weight: .medium))
-                                if !comp.detail.isEmpty {
-                                    Text(comp.detail)
-                                        .font(.system(size: 12))
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                            Spacer()
-                            Button {
-                                exportURL = comp.url
-                                showShare = true
-                            } label: {
-                                Image(systemName: "square.and.arrow.up")
-                                    .font(.system(size: 18))
-                            }
-                            .buttonStyle(.plain)
+                List {
+                    Section(header: Text("Составляющие · \(items.count)")) {
+                        ForEach(items) { comp in
+                            row(for: comp)
                         }
+                        .onDelete(perform: delete)
+                    }
+                    Section {
+                        Text("Кнопка «Играть все» проигрывает все оставшиеся составляющие вместе (то, что вы не удалили). «Найти источник» открывает искатель направления: поворачивайте телефон — стрелка покажет, куда навестись на выбранный звук. Свайп по строке или «Удалить» убирает составляющую.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
                     }
                 }
-                Section {
-                    Text("Приложение разделило запись на устойчивые тона (по их гармоникам), ударные (стук, щелчки) и шум/остаток. Каждую составляющую можно прослушать и сохранить как WAV. Звуки, совпадающие по частоте и времени, разделить нельзя.")
+            }
+            .navigationTitle("Составляющие звука")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItemGroup(placement: .navigationBarLeading) {
+                    Button {
+                        togglePlayAll()
+                    } label: {
+                        Label(playingAll ? "Стоп" : "Играть все",
+                              systemImage: playingAll ? "stop.fill" : "play.fill")
+                    }
+                    .disabled(items.isEmpty)
+
+                    if items.count < allComponents.count {
+                        Button("Вернуть") { restore() }
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Готово") { dismiss() }
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
+        .onAppear { rebuildOverlay() }
+        .onChange(of: playingID) { _ in rebuildOverlay() }
+        .onChange(of: playingAll) { _ in rebuildOverlay() }
+        .onChange(of: items.count) { _ in rebuildOverlay() }
+        .onChange(of: playback.isPlaying) { playing in
+            if !playing {
+                playingAll = false
+                playingID = nil
+                rebuildOverlay()
+            }
+        }
+        .onDisappear { playback.stop() }
+        .sheet(isPresented: $showShare) {
+            if let url = exportURL {
+                ShareSheet(items: [url])
+            }
+        }
+        .fullScreenCover(item: $finderComponent) { comp in
+            SoundFinderView(component: comp)
+        }
+    }
+
+    // MARK: - Превью спектра с подсветкой
+
+    private var preview: some View {
+        ZStack {
+            if let spec = spectrogram {
+                Image(decorative: spec, scale: 1)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .opacity(0.5)
+            } else {
+                Color.black
+            }
+
+            if let ov = overlayImage {
+                Image(decorative: ov, scale: 1)
+                    .resizable()
+                    .interpolation(.none)
+            }
+
+            GeometryReader { geo in
+                if playback.isPlaying {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.9))
+                        .frame(width: 1.5)
+                        .offset(x: CGFloat(playback.progress) * (geo.size.width - 1.5))
+                }
+            }
+        }
+        .frame(height: 130)
+        .frame(maxWidth: .infinity)
+        .clipped()
+        .overlay(Rectangle().stroke(Color.gray.opacity(0.4), lineWidth: 1))
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+    }
+
+    private func row(for comp: AutoComponent) -> some View {
+        HStack(spacing: 12) {
+            Button {
+                toggle(comp)
+            } label: {
+                Image(systemName: isActive(comp) ? "pause.circle.fill" : "play.circle.fill")
+                    .font(.system(size: 26))
+            }
+            .buttonStyle(.plain)
+
+            Circle()
+                .fill(color(for: comp))
+                .frame(width: 10, height: 10)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(comp.title)
+                    .font(.system(size: 15, weight: .medium))
+                if !comp.detail.isEmpty {
+                    Text(comp.detail)
                         .font(.system(size: 12))
                         .foregroundColor(.secondary)
                 }
             }
-            .navigationTitle("Составляющие звука")
+            Spacer()
+
+            Menu {
+                Button {
+                    finderComponent = comp
+                } label: {
+                    Label("Найти источник", systemImage: "location.north.line")
+                }
+                Button {
+                    exportURL = comp.url
+                    showShare = true
+                } label: {
+                    Label("Сохранить WAV", systemImage: "square.and.arrow.up")
+                }
+                Button(role: .destructive) {
+                    remove(comp)
+                } label: {
+                    Label("Удалить", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 18))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func isActive(_ comp: AutoComponent) -> Bool {
+        (playingID == comp.id && playback.isPlaying) || playingAll
+    }
+
+    private func color(for comp: AutoComponent) -> Color {
+        guard let index = items.firstIndex(where: { $0.id == comp.id }) else { return .gray }
+        let c = Self.palette[index % Self.palette.count]
+        return Color(red: Double(c.0), green: Double(c.1), blue: Double(c.2))
+    }
+
+    // MARK: - Действия со списком
+
+    private func toggle(_ comp: AutoComponent) {
+        if playingID == comp.id && playback.isPlaying {
+            playback.stop()
+            playingID = nil
+            playingAll = false
+        } else {
+            playingAll = false
+            playback.play(url: comp.url)
+            playingID = comp.id
+        }
+    }
+
+    private func togglePlayAll() {
+        if playingAll && playback.isPlaying {
+            playback.stop()
+            playingAll = false
+            playingID = nil
+            return
+        }
+        playAll()
+    }
+
+    private func playAll() {
+        guard !items.isEmpty else { return }
+        var count = Int.max
+        for comp in items { count = Swift.min(count, comp.samples.count) }
+        guard count > 0, count != Int.max else { return }
+
+        var mix = [Float](repeating: 0, count: count)
+        for comp in items {
+            let s = comp.samples
+            for i in 0..<count { mix[i] += s[i] }
+        }
+        for i in 0..<count {
+            mix[i] = Swift.max(-1, Swift.min(1, mix[i]))
+        }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mix-\(UUID().uuidString).wav")
+        do {
+            try WavWriter.write(samples: mix, sampleRate: sampleRate, to: url)
+        } catch {
+            playback.errorMessage = "Не удалось подготовить микс: \(error.localizedDescription)"
+            return
+        }
+        playingID = nil
+        playingAll = true
+        playback.play(url: url)
+    }
+
+    private func delete(at offsets: IndexSet) {
+        playback.stop()
+        playingID = nil
+        playingAll = false
+        items.remove(atOffsets: offsets)
+        rebuildOverlay()
+    }
+
+    private func remove(_ comp: AutoComponent) {
+        playback.stop()
+        playingID = nil
+        playingAll = false
+        items.removeAll { $0.id == comp.id }
+        rebuildOverlay()
+    }
+
+    private func restore() {
+        playback.stop()
+        playingID = nil
+        playingAll = false
+        items = allComponents
+        rebuildOverlay()
+    }
+
+    // MARK: - Сборка цветного слоя
+
+    private func rebuildOverlay() {
+        overlayImage = makeOverlay()
+    }
+
+    private func makeOverlay() -> CGImage? {
+        guard let first = items.first else { return nil }
+        let cols = first.previewCols
+        let rows = first.previewRows
+        guard cols > 0, rows > 0 else { return nil }
+        let cellCount = cols * rows
+
+        var px = [UInt8](repeating: 0, count: cellCount * 4)
+        let anyFocus = playingAll || playingID != nil
+
+        for (index, comp) in items.enumerated() {
+            guard comp.preview.count == cellCount else { continue }
+            let isFocus = playingAll || (playingID == comp.id)
+            let alphaScale: Float = anyFocus ? (isFocus ? 1.0 : 0.18) : 0.75
+            let c = Self.palette[index % Self.palette.count]
+            let p = comp.preview
+            for i in 0..<cellCount {
+                let v = p[i]
+                if v <= 0.08 { continue }
+                let a = Swift.min(1, v) * alphaScale
+                if a <= 0 { continue }
+                let base = i * 4
+                let sr = c.0 * a
+                let sg = c.1 * a
+                let sb = c.2 * a
+                let da = Float(px[base + 3]) / 255
+                let inv = 1 - a
+                let oa = a + da * inv
+                px[base + 0] = UInt8(Swift.min(255, Swift.max(0, (sr + Float(px[base + 0]) / 255 * inv) * 255)))
+                px[base + 1] = UInt8(Swift.min(255, Swift.max(0, (sg + Float(px[base + 1]) / 255 * inv) * 255)))
+                px[base + 2] = UInt8(Swift.min(255, Swift.max(0, (sb + Float(px[base + 2]) / 255 * inv) * 255)))
+                px[base + 3] = UInt8(Swift.min(255, Swift.max(0, oa * 255)))
+            }
+        }
+
+        let space = CGColorSpaceCreateDeviceRGB()
+        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        guard let provider = CGDataProvider(data: Data(px) as CFData) else { return nil }
+        return CGImage(width: cols,
+                       height: rows,
+                       bitsPerComponent: 8,
+                       bitsPerPixel: 32,
+                       bytesPerRow: cols * 4,
+                       space: space,
+                       bitmapInfo: info,
+                       provider: provider,
+                       decode: nil,
+                       shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+}
+
+// MARK: - Искатель направления
+
+struct SoundFinderView: View {
+    let component: AutoComponent
+    @StateObject private var finder: SoundFinder
+    @Environment(\.dismiss) private var dismiss
+
+    init(component: AutoComponent) {
+        self.component = component
+        self._finder = StateObject(wrappedValue: SoundFinder(bandLow: component.bandLow,
+                                                             bandHigh: component.bandHigh))
+    }
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 18) {
+                Text(bandText)
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary)
+
+                dial
+
+                levelBar
+
+                Text(hint)
+                    .font(.system(size: 13))
+                    .multilineTextAlignment(.center)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal)
+
+                Spacer(minLength: 0)
+
+                Button {
+                    if finder.isRunning {
+                        finder.stop()
+                    } else {
+                        finder.start()
+                    }
+                } label: {
+                    Label(finder.isRunning ? "Стоп" : "Начать поиск",
+                          systemImage: finder.isRunning ? "stop.fill" : "location.north.line.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(finder.isRunning ? .red : .accentColor)
+            }
+            .padding()
+            .navigationTitle(component.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -551,12 +882,102 @@ struct AutoDecomposeView: View {
             }
         }
         .navigationViewStyle(.stack)
-        .onDisappear { playback.stop() }
-        .sheet(isPresented: $showShare) {
-            if let url = exportURL {
-                ShareSheet(items: [url])
-            }
+        .onAppear { finder.start() }
+        .onDisappear { finder.stop() }
+        .alert("Ошибка", isPresented: Binding(
+            get: { finder.errorMessage != nil },
+            set: { if !$0 { finder.errorMessage = nil } }
+        )) {
+            Button("ОК", role: .cancel) {}
+        } message: {
+            Text(finder.errorMessage ?? "")
         }
+    }
+
+    private var dial: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.gray.opacity(0.3), lineWidth: 2)
+
+            ForEach(0..<12, id: \.self) { i in
+                Rectangle()
+                    .fill(Color.gray.opacity(0.35))
+                    .frame(width: 1.5, height: 10)
+                    .offset(y: -108)
+                    .rotationEffect(.degrees(Double(i) * 30))
+            }
+
+            Image(systemName: "location.north.fill")
+                .font(.system(size: 96))
+                .foregroundColor(finder.hasDirection ? .accentColor : Color.gray.opacity(0.5))
+                .rotationEffect(.degrees(finder.arrowDegrees))
+                .animation(.easeOut(duration: 0.12), value: finder.arrowDegrees)
+
+            Circle()
+                .fill(Color.accentColor)
+                .frame(width: 10, height: 10)
+        }
+        .frame(width: 240, height: 240)
+    }
+
+    private var levelBar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Уровень выбранного звука")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(String(format: "%.0f дБ", finder.levelDB))
+                    .font(.system(size: 12, design: .monospaced))
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.gray.opacity(0.2))
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: geo.size.width * levelFraction)
+                }
+            }
+            .frame(height: 14)
+            Text(String(format: "Максимум: %.0f дБ", finder.bestDB))
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var levelFraction: CGFloat {
+        let lo: Float = -80
+        let hi: Float = -10
+        let v = (finder.levelDB - lo) / (hi - lo)
+        return CGFloat(Swift.max(0, Swift.min(1, v)))
+    }
+
+    private var bandText: String {
+        if component.bandLow <= 0 {
+            return "Широкополосный звук"
+        }
+        return "Полоса \(frequencyText(component.bandLow))–\(frequencyText(component.bandHigh))"
+    }
+
+    private func frequencyText(_ hz: Double) -> String {
+        if hz >= 1000 {
+            return String(format: "%.1f кГц", hz / 1000)
+        }
+        return String(format: "%.0f Гц", hz)
+    }
+
+    private var hint: String {
+        if !finder.motionAvailable {
+            return "На этом устройстве недоступен датчик ориентации, искатель направления не работает."
+        }
+        if !finder.isRunning {
+            return "Нажмите «Начать поиск»."
+        }
+        if !finder.hasDirection {
+            return "Медленно поворачивайте телефон, пока не поймаете самый громкий звук выбранной составляющей."
+        }
+        return "Стрелка показывает, где выбранный звук был громче всего. Поворачивайтесь, пока стрелка не укажет вперёд (вверх). Полоса уровня поможет понять, приближаетесь ли вы к источнику."
     }
 }
 
@@ -593,7 +1014,7 @@ struct SettingsView: View {
                     }
                 }
                 Section(header: Text("Справка")) {
-                    Text("Чтобы разделить звук на составляющие: остановите запись и нажмите «Авто» — приложение само найдёт отдельные тона, ударные и шум. Либо проведите пальцем по спектрограмме (это выделит область «частота × время»), затем «Выдел.» проиграет только её, а «Остал.» — всё, кроме неё.")
+                    Text("Чтобы разделить звук на составляющие: остановите запись и нажмите «Авто» — приложение само найдёт отдельные тона, ударные и шум. Каждую составляющую можно прослушать, увидеть её расположение по частоте и времени, удалить ненужную, проиграть оставшиеся вместе и найти источник звука по направлению. Либо проведите пальцем по спектрограмме (это выделит область «частота × время»), затем «Выдел.» проиграет только её, а «Остал.» — всё, кроме неё.")
                         .font(.system(size: 13))
                 }
             }
