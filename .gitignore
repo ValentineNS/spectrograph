@@ -1,0 +1,15 @@
+# Сгенерированные файлы Xcode
+build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+
+# Скачанные сборки (не хранить в репозитории)
+*.ipa
+*.zip
+Spectrograph-ipa/
+
+# Логи CI (диагностика)
+_ci_logs/
+
+.DS_Store

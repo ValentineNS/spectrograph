@@ -1,0 +1,36 @@
+name: Spectrograph
+
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+targets:
+  Spectrograph:
+    type: application
+    platform: iOS
+    sources:
+      - path: Spectrograph
+        excludes:
+          - "Info.plist"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.spectrograph
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Spectrograph/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_STYLE: Automatic
+
+schemes:
+  Spectrograph:
+    build:
+      targets:
+        Spectrograph: all
+    run:
+      config: Debug
+    archive:
+      config: Release
