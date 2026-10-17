@@ -1,8 +1,8 @@
 import Foundation
 import Accelerate
 
-/// Быстрое преобразование Фурье для вещественного сигнала (Accelerate / vDSP).
-/// Возвращает магнитуды в дБ по `size/2` бинам (от 0 до Найквиста).
+/// Быстрый анализатор спектра на базе Accelerate / vDSP.
+/// Возвращает магнитуды в `size/2` точках (от 0 до Найквиста).
 final class FFTProcessor {
     let size: Int
 
@@ -19,7 +19,7 @@ final class FFTProcessor {
 
         self.size = size
 
-        // log2(size) без плавающих ошибок
+        // log2(size) для преобразования Фурье
         var k: vDSP_Length = 0
         var s = size
         while s > 1 { s >>= 1; k += 1 }
@@ -42,8 +42,27 @@ final class FFTProcessor {
         vDSP_destroy_fftsetup(setup)
     }
 
-    /// Вход: ровно `size` отсчётов (моно). Выход: `size/2` значений в дБ.
+    /// Вход: массив `size` отсчётов (окно). Выход: `size/2` магнитуд в дБ.
     func magnitudesDB(_ input: [Float]) -> [Float] {
+        let m = linearMagnitudes(input)
+        let n = size
+        var out = [Float](repeating: -160, count: n / 2)
+        let scale = Float(2.0) / Float(n)      // нормировка преобразования zrip
+        let floorValue: Float = 1e-7
+        for i in 0..<(n / 2) {
+            out[i] = 20.0 * log10f(Swift.max(m[i] * scale, floorValue))
+        }
+        return out
+    }
+
+    /// Вход: массив `size` отсчётов. Выход: `size/2` линейных магнитуд.
+    /// Абсолютный масштаб здесь не нормируется — подходит для отношений
+    /// (например, гармонико-перкуссионного разделения и поиска тонов).
+    func magnitudesLinear(_ input: [Float]) -> [Float] {
+        linearMagnitudes(input)
+    }
+
+    private func linearMagnitudes(_ input: [Float]) -> [Float] {
         let n = size
         precondition(input.count == n, "FFTProcessor: ожидается \(n) отсчётов")
 
@@ -66,13 +85,6 @@ final class FFTProcessor {
                 vDSP_zvabs(&split, 1, &m, 1, vDSP_Length(n / 2))
             }
         }
-
-        var out = [Float](repeating: -160, count: n / 2)
-        let scale = Float(2.0) / Float(n)      // нормировка обратного БПФ (zrip)
-        let floorValue: Float = 1e-7
-        for i in 0..<(n / 2) {
-            out[i] = 20.0 * log10f(Swift.max(m[i] * scale, floorValue))
-        }
-        return out
+        return m
     }
 }

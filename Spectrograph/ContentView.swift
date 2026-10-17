@@ -21,20 +21,35 @@ final class AppModel: ObservableObject {
     }
 }
 
+/// Одно активное модальное окно.
+private enum ActiveSheet: Identifiable {
+    case settings
+    case share(URL)
+    case auto
+
+    var id: String {
+        switch self {
+        case .settings: return "settings"
+        case .share(let url): return "share-\(url.absoluteString)"
+        case .auto: return "auto"
+        }
+    }
+}
+
 struct SpectrographScreen: View {
     @ObservedObject var settings: SpectrogramSettings
     @ObservedObject var analyzer: AudioAnalyzer
 
     @StateObject private var playback = AudioPlayback()
 
-    @State private var showSettings = false
-    @State private var showShare = false
-    @State private var exportURL: URL?
+    @State private var activeSheet: ActiveSheet?
     @State private var pixelWidth: Double = 0
 
     @State private var selections: [SpectralSelection] = []
     @State private var isProcessing = false
-    @State private var showAudioShare = false
+
+    @State private var autoComponents: [AutoComponent] = []
+    @State private var isAutoProcessing = false
 
     private static let fileFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -97,17 +112,14 @@ struct SpectrographScreen: View {
         }
         .padding(8)
         .background(Color(uiColor: .systemBackground))
-        .sheet(isPresented: $showSettings) {
-            SettingsView(settings: settings)
-        }
-        .sheet(isPresented: $showShare) {
-            if let url = exportURL {
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .settings:
+                SettingsView(settings: settings)
+            case .share(let url):
                 ShareSheet(items: [url])
-            }
-        }
-        .sheet(isPresented: $showAudioShare) {
-            if let url = exportURL {
-                ShareSheet(items: [url])
+            case .auto:
+                AutoDecomposeView(components: autoComponents, playback: playback)
             }
         }
         .alert("Ошибка", isPresented: Binding(
@@ -169,7 +181,15 @@ struct SpectrographScreen: View {
 
     @ViewBuilder
     private var hintRow: some View {
-        if isProcessing {
+        if isAutoProcessing {
+            HStack(spacing: 6) {
+                ProgressView()
+                Text("Раскладываю звук на составляющие…")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+        } else if isProcessing {
             HStack(spacing: 6) {
                 ProgressView()
                 Text("Обработка звука…")
@@ -183,7 +203,7 @@ struct SpectrographScreen: View {
                 .foregroundColor(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else if canSelect {
-            Text("Проведите по спектрограмме, чтобы выделить составляющую. Выделений: \(selections.count).")
+            Text("Проведите по спектрограмме, чтобы выделить составляющую, или нажмите «Авто» для автоматического разложения. Выделений: \(selections.count).")
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -219,7 +239,7 @@ struct SpectrographScreen: View {
                 .tint(analyzer.isRunning ? .red : .accentColor)
 
                 Button {
-                    showSettings = true
+                    activeSheet = .settings
                 } label: {
                     Image(systemName: "slider.horizontal.3")
                         .frame(width: 30)
@@ -244,6 +264,13 @@ struct SpectrographScreen: View {
             if canSelect {
                 HStack(spacing: 6) {
                     Button {
+                        runAuto()
+                    } label: {
+                        Label("Авто", systemImage: "sparkles")
+                    }
+                    .disabled(isProcessing || isAutoProcessing)
+
+                    Button {
                         play(.isolate)
                     } label: {
                         Label("Выдел.", systemImage: "play.circle")
@@ -257,14 +284,9 @@ struct SpectrographScreen: View {
                     }
                     .disabled(selections.isEmpty || isProcessing)
 
-                    Button {
-                        play(nil)
-                    } label: {
-                        Label("Ориг.", systemImage: "play.circle")
-                    }
-                    .disabled(isProcessing)
-
                     Menu {
+                        Button("Прослушать оригинал") { play(nil) }
+                        Divider()
                         if selections.isEmpty {
                             Text("Нет выделений")
                         } else {
@@ -301,6 +323,45 @@ struct SpectrographScreen: View {
         }
     }
 
+    // MARK: - Автоматическое разложение
+
+    private func runAuto() {
+        guard !analyzer.isRunning else {
+            analyzer.errorMessage = "Сначала остановите запись."
+            return
+        }
+        let meta = analyzer.store.meta
+        guard meta.totalFrames > 4 else {
+            analyzer.errorMessage = "Нет записанного звука."
+            return
+        }
+
+        let samples = analyzer.store.snapshot()
+        let sampleRate = meta.sampleRate
+        let fftSize = meta.fftSize
+        let frames = meta.totalFrames
+        let maxFreq = min(effectiveMaxFrequency, sampleRate / 2)
+
+        playback.stop()
+        isAutoProcessing = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let components = AutoSeparator.decompose(samples: samples,
+                                                     sampleRate: sampleRate,
+                                                     fftSize: fftSize,
+                                                     totalFrames: frames,
+                                                     maxFrequency: maxFreq)
+            DispatchQueue.main.async {
+                self.isAutoProcessing = false
+                if components.isEmpty {
+                    self.analyzer.errorMessage = "Не удалось разложить звук на составляющие."
+                } else {
+                    self.autoComponents = components
+                    self.activeSheet = .auto
+                }
+            }
+        }
+    }
+
     // MARK: - Обработка и воспроизведение
 
     private func play(_ mode: MaskMode?) {
@@ -320,8 +381,7 @@ struct SpectrographScreen: View {
     private func exportAudio(_ mode: MaskMode?) {
         processAudio(mode: mode, selections: selections) { url in
             if let url = url {
-                exportURL = url
-                showAudioShare = true
+                activeSheet = .share(url)
             }
         }
     }
@@ -416,10 +476,86 @@ struct SpectrographScreen: View {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
         do {
             try data.write(to: url)
-            exportURL = url
-            showShare = true
+            activeSheet = .share(url)
         } catch {
             analyzer.errorMessage = "Не удалось сохранить PNG: \(error.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Окно «Составляющие звука»
+
+struct AutoDecomposeView: View {
+    let components: [AutoComponent]
+    @ObservedObject var playback: AudioPlayback
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var playingID: UUID?
+    @State private var exportURL: URL?
+    @State private var showShare = false
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section(header: Text("Составляющие · \(components.count)")) {
+                    ForEach(components) { comp in
+                        HStack(spacing: 12) {
+                            Button {
+                                if playingID == comp.id && playback.isPlaying {
+                                    playback.stop()
+                                    playingID = nil
+                                } else {
+                                    playback.play(url: comp.url)
+                                    playingID = comp.id
+                                }
+                            } label: {
+                                Image(systemName: (playingID == comp.id && playback.isPlaying)
+                                      ? "pause.circle.fill" : "play.circle.fill")
+                                    .font(.system(size: 27))
+                            }
+                            .buttonStyle(.plain)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(comp.title)
+                                    .font(.system(size: 15, weight: .medium))
+                                if !comp.detail.isEmpty {
+                                    Text(comp.detail)
+                                        .font(.system(size: 12))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Button {
+                                exportURL = comp.url
+                                showShare = true
+                            } label: {
+                                Image(systemName: "square.and.arrow.up")
+                                    .font(.system(size: 18))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                Section {
+                    Text("Приложение разделило запись на устойчивые тона (по их гармоникам), ударные (стук, щелчки) и шум/остаток. Каждую составляющую можно прослушать и сохранить как WAV. Звуки, совпадающие по частоте и времени, разделить нельзя.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("Составляющие звука")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Готово") { dismiss() }
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
+        .onDisappear { playback.stop() }
+        .sheet(isPresented: $showShare) {
+            if let url = exportURL {
+                ShareSheet(items: [url])
+            }
         }
     }
 }
@@ -457,7 +593,7 @@ struct SettingsView: View {
                     }
                 }
                 Section(header: Text("Справка")) {
-                    Text("Чтобы разделить звук на составляющие: остановите запись, проведите пальцем по спектрограмме (это выделит область «частота × время»), затем «Выдел.» проиграет только её, а «Остал.» — всё, кроме неё.")
+                    Text("Чтобы разделить звук на составляющие: остановите запись и нажмите «Авто» — приложение само найдёт отдельные тона, ударные и шум. Либо проведите пальцем по спектрограмме (это выделит область «частота × время»), затем «Выдел.» проиграет только её, а «Остал.» — всё, кроме неё.")
                         .font(.system(size: 13))
                 }
             }

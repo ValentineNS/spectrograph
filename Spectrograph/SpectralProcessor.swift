@@ -2,7 +2,7 @@ import Foundation
 import Accelerate
 
 /// Прямоугольное выделение на спектрограмме. Координаты нормированы 0…1:
-/// `x` — время (слева направо), `y` — частота (снизу вверх).
+/// `x` — время (слева старая запись), `y` — частота (сверху вниз).
 struct SpectralSelection: Identifiable, Equatable {
     let id = UUID()
     var x0: Double
@@ -18,7 +18,7 @@ struct SpectralSelection: Identifiable, Equatable {
     }
 }
 
-/// Как обрабатывать выделенные области.
+/// Режим обработки выделенных областей.
 enum MaskMode {
     /// Оставить только выделенное.
     case isolate
@@ -26,8 +26,10 @@ enum MaskMode {
     case remove
 }
 
-/// Кратковременное преобразование Фурье с маской и обратным перекрытием.
-/// Позволяет «вырезать» из звука отдельные составляющие по частоте и времени.
+/// Пересобирает записанный звук с заданной маской (прямоугольники или
+/// произвольная матрица «кадр × бин») через обратное перекрытие.
+/// Коэффициент нормировки обратного БПФ калибруется по окну — не зависит
+/// от соглашений vDSP.
 final class SpectralProcessor {
     let fftSize: Int
     let hop: Int
@@ -61,10 +63,10 @@ final class SpectralProcessor {
         vDSP_destroy_fftsetup(setup)
     }
 
-    // MARK: - Калибровка нормировки обратного БПФ
+    // MARK: - Калибровка обратного преобразования
 
-    /// Прямое и обратное zrip-преобразование связаны постоянным множителем.
-    /// Измеряем его один раз на тестовом сигнале, чтобы не зависеть от соглашений vDSP.
+    /// Прямой и обратный проход zrip-преобразования над окном даёт усиление.
+    /// Считаем его один раз при создании, чтобы не зависеть от нормировки vDSP.
     private static func calibrate(setup: FFTSetup, log2n: vDSP_Length, n: Int, window: [Float]) -> Float {
         let bins = n / 2
         var realp = [Float](repeating: 0, count: bins)
@@ -99,7 +101,7 @@ final class SpectralProcessor {
         return 1 / (num / den)
     }
 
-    // MARK: - Отображение координат
+    // MARK: - Соответствие координат кадрам
 
     private func frameForX(_ x: Double, totalFrames: Int, visibleColumns: Int) -> Double {
         let cols = Swift.max(1, visibleColumns)
@@ -107,9 +109,9 @@ final class SpectralProcessor {
         return Double(totalFrames - cols) + cx * Double(cols - 1)
     }
 
-    // MARK: - Основная обработка
+    // MARK: - Восстановление звука по прямоугольным выделениям
 
-    /// Пересобирает звук, оставляя или убирая выделенные области.
+    /// Возвращает пересобранный звук, оставив или убрав выделенные области.
     func render(samples: [Float],
                 sampleRate: Double,
                 totalFrames: Int,
@@ -158,6 +160,43 @@ final class SpectralProcessor {
             regions.append(Region(f0: f0, f1: f1, bins: flags))
         }
 
+        let isolate = (mode == .isolate)
+        return renderCore(samples: samples, totalFrames: totalFrames) { f, k in
+            var inside = false
+            for r in regions {
+                if f >= r.f0 && f <= r.f1 && r.bins[k] {
+                    inside = true
+                    break
+                }
+            }
+            return (isolate == inside) ? 1 : 0
+        }
+    }
+
+    // MARK: - Восстановление звука по произвольной маске
+
+    /// `mask` — матрица «кадр × бин» (размер `totalFrames * (fftSize/2)`).
+    func renderWithMask(samples: [Float],
+                        totalFrames: Int,
+                        mask: [Float]) -> [Float] {
+        let bins = fftSize / 2
+        guard totalFrames > 0, bins > 0, mask.count >= totalFrames * bins else { return [] }
+        let m = mask
+        return renderCore(samples: samples, totalFrames: totalFrames) { f, k in
+            m[f * bins + k]
+        }
+    }
+
+    // MARK: - Общее ядро пересборки
+
+    private func renderCore(samples: [Float],
+                            totalFrames: Int,
+                            maskProvider: (Int, Int) -> Float) -> [Float] {
+        let n = fftSize
+        let bins = n / 2
+        let outLen = (totalFrames - 1) * hop + n
+        guard totalFrames > 0, bins > 0, outLen > 0, samples.count >= outLen else { return [] }
+
         let realp = UnsafeMutablePointer<Float>.allocate(capacity: bins)
         let imagp = UnsafeMutablePointer<Float>.allocate(capacity: bins)
         let frameBuf = UnsafeMutablePointer<Float>.allocate(capacity: n)
@@ -180,7 +219,6 @@ final class SpectralProcessor {
         vDSP_vmul(window, 1, window, 1, &wsq, 1, vDSP_Length(n))
 
         var split = DSPSplitComplex(realp: realp, imagp: imagp)
-        let isolate = (mode == .isolate)
         let win = window
 
         samples.withUnsafeBufferPointer { sb in
@@ -195,14 +233,7 @@ final class SpectralProcessor {
                 vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
 
                 for k in 0..<bins {
-                    var inside = false
-                    for r in regions {
-                        if f >= r.f0 && f <= r.f1 && r.bins[k] {
-                            inside = true
-                            break
-                        }
-                    }
-                    let keep: Float = (isolate == inside) ? 1 : 0
+                    let keep = maskProvider(f, k)
                     realp[k] *= keep
                     imagp[k] *= keep
                 }
